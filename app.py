@@ -259,10 +259,23 @@ with tab3:
         if val == 0: return ""
         elif val < 0.1: return "<0.1"
         else: return f"{val:.1f}"
-
+    
     st.markdown("<h3 style='text-align: center; margin-bottom: -20px;'>Table Position</h3>", unsafe_allow_html=True)
     rank_df.index.name = "Team"
-    styled_df = rank_df.style.format(format_prob)\
-                     .background_gradient(cmap='Greens', axis=None, vmin=0, vmax=100)
-
-    st.dataframe(styled_df, use_container_width=True, height=750)
+    
+    # --- PLOTLY HEATMAP OVERRIDE ---
+    fig = px.imshow(
+        rank_df, 
+        text_auto=".1f", # Formats the text to 1 decimal place
+        color_continuous_scale="Greens",
+        aspect="auto",
+        labels=dict(x="Final Rank", y="Team", color="Probability (%)")
+    )
+    
+    # Move the X-axis labels (1-20) to the top of the chart
+    fig.update_xaxes(side="top", dtick=1)
+    
+    # Hide the color scale bar on the right side to keep it clean
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=50, l=0, r=0, b=0), height=750)
+    
+    st.plotly_chart(fig, use_container_width=True)
