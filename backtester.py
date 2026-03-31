@@ -45,13 +45,10 @@ def calculate_elo(df, k_factor=20):
 pl_df = calculate_elo(pl_df)
 test_df = pl_df.tail(380).reset_index(drop=True)
 
-# --- THE TRANSPARENT SIMULATION ENGINE ---
 def run_simulation(threshold):
     bankroll = 1000.00
     history = []
     wins, losses, total_wagered = 0, 0, 0
-    
-    # Transparency Trackers
     correct_home, total_home = 0, 0
     correct_away, total_away = 0, 0
     avg_ai_conf = []
@@ -60,7 +57,6 @@ def run_simulation(threshold):
         home, away, target_date = row['home_team'], row['away_team'], row['match_date']
         actual = 2 if row['home_goals'] > row['away_goals'] else 1 if row['home_goals'] == row['away_goals'] else 0
 
-        # Context Logic (Rolling xG)
         pl_games = pl_df[(pl_df['home_team'] == home) | (pl_df['away_team'] == home)]
         past_pl = pl_games[pl_games['match_date'] < target_date].sort_values('match_date', ascending=False).head(5)
         h_att = np.mean([g['Total_xG_home'] if g['home_team'] == home else g['Total_xG_away'] for _, g in past_pl.iterrows()]) / league_avg_xg if not past_pl.empty else 1.0
@@ -101,7 +97,6 @@ def run_simulation(threshold):
         
         history.append({"date": target_date, "bankroll": bankroll})
     
-    # Calculate Results Metadata
     accuracy = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
     mean_conf = np.mean(avg_ai_conf) if avg_ai_conf else 0
     
@@ -127,22 +122,13 @@ for t in np.arange(0.0, 0.05, 0.002):
         'data': res
     })
 
-# Select best based on Profit
 best_run = max(optimization_results, key=lambda x: x['profit'])
 best_threshold = best_run['threshold']
 res = best_run['data']
 
-# Save history for Streamlit app
+# THIS IS THE CRITICAL LINE THAT CREATES THE FILE FOR THE APP
 pd.DataFrame(res['history']).to_csv('Data/bankroll_history.csv', index=False)
 
 print("-" * 60)
 print(f"🎯 SWEET SPOT FOUND: {best_threshold*100:.1f}% Edge")
-print("-" * 60)
-print(f"Model Accuracy on Bets: {res['accuracy']:.1f}% ({res['wins']}/{res['wins']+res['losses']})")
-print(f"Average AI Confidence:  {res['avg_conf']*100:.1f}%")
-print(f"Home Win Performance:   {res['home_split'][0]}/{res['home_split'][1]} ({res['home_split'][0]/res['home_split'][1]*100 if res['home_split'][1]>0 else 0:.1f}%)")
-print(f"Away Win Performance:   {res['away_split'][0]}/{res['away_split'][1]} ({res['away_split'][0]/res['away_split'][1]*100 if res['away_split'][1]>0 else 0:.1f}%)")
-print("-" * 60)
-print(f"Total Profit:           ${best_run['profit']:,.2f}")
-print(f"Total Bets Placed:      {res['wins'] + res['losses']}")
 print("Bankroll history saved to Data/bankroll_history.csv")

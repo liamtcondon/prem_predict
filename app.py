@@ -1,206 +1,268 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from scipy.stats import poisson
+import numpy as np  
+import joblib
 import plotly.express as px
-import joblib 
-import requests
-from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+from monte_carlo import generate_season_projections
 
-# --- API & SCRAPER CONFIGURATION ---
-SCRAPER_API_KEY = "YOUR_API_KEY_HERE"
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Premier League ML Engine", page_icon="⚽", layout="wide")
 
-# 1. Page Configuration
-st.set_page_config(page_title="Premier League Predictor", layout="centered")
-st.title("⚽ Premier League Match Predictor")
-st.write("Compare AI probabilities against Vegas odds to find betting value.")
+# --- LOAD AI MODELS & DATA ---
+@st.cache_resource
+def load_brains():
+    model = joblib.load('Data/xgboost_pl_model.pkl')
+    league_avg_xg = joblib.load('Data/league_avg_xg.pkl')
+    elos = joblib.load('Data/elo_dict.pkl')
+    return model, league_avg_xg, elos
 
-# 2. Load Data
-@st.cache_data
-def load_data():
-    df = pd.read_csv('Data/live_pl_history.csv')
-    df['match_date'] = pd.to_datetime(df['match_date'], utc=True).dt.tz_localize(None)
-    avg_home_xg = df['Total_xG_home'].mean()
-    avg_away_xg = df['Total_xG_away'].mean()
-    overall_avg = (avg_home_xg + avg_away_xg) / 2
-    teams = sorted(list(set(df['home_team']).union(set(df['away_team']))))
-    return df, teams, overall_avg
+model, league_avg_xg, current_elos = load_brains()
 
-history, ALL_TEAMS, LEAGUE_AVG_XG = load_data()
+# --- DATA PREP (Global) ---
+sched_df = pd.read_csv('Data/global_schedule.csv')
+sched_df['date'] = pd.to_datetime(sched_df['date'], utc=True)
 
-# 3. Engines
-def get_rolling_stats(team_name, history, window=5):
-    team_games = history[(history['home_team'] == team_name) | (history['away_team'] == team_name)]
-    team_games = team_games.sort_values('match_date', ascending=False)
-    last_n = team_games.head(window)
-    if len(last_n) < 1: return 1.3, 1.3 
-    xg_for, xg_against = [], []
-    for _, row in last_n.iterrows():
-        if row['home_team'] == team_name:
-            xg_for.append(row['Total_xG_home']); xg_against.append(row['Total_xG_away'])
+history_df = pd.read_csv('Data/live_pl_history.csv')
+history_df['match_date'] = pd.to_datetime(history_df['match_date'], utc=True)
+
+# --- HELPER: GET TEAM FORM ---
+def get_team_form(team_name):
+    team_games = history_df[(history_df['home_team'] == team_name) | (history_df['away_team'] == team_name)]
+    last_5 = team_games.sort_values('match_date', ascending=False).head(5)
+    
+    xg_f, xg_a = [], []
+    for _, g in last_5.iterrows():
+        if g['home_team'] == team_name:
+            xg_f.append(g['Total_xG_home'])
+            xg_a.append(g['Total_xG_away'])
         else:
-            xg_for.append(row['Total_xG_away']); xg_against.append(row['Total_xG_home'])
-    return np.mean(xg_for), np.mean(xg_against)
+            xg_f.append(g['Total_xG_away'])
+            xg_a.append(g['Total_xG_home'])
+            
+    if not xg_f: return 1.3, 1.3
+    return np.mean(xg_f) / league_avg_xg, np.mean(xg_a) / league_avg_xg
 
-TEAM_COLORS = {
-    "Arsenal": "#EF0107", "Manchester City": "#6CABDD", "Manchester United": "#DA291C",
-    "Liverpool": "#C8102E", "Chelsea": "#034694", "Tottenham": "#132257",
-    "Newcastle United": "#241F20", "Aston Villa": "#670E36", "Everton": "#003399",
-    "Brighton": "#0057B8", "West Ham": "#7A263A", "Brentford": "#E30613",
-    "Nottingham Forest": "#E53233", "Crystal Palace": "#1B458F", "Fulham": "#000000",
-    "Bournemouth": "#B50E12", "Wolverhampton Wanderers": "#FDB913", "Leicester City": "#003090",
-    "Southampton": "#D71920", "Leeds United": "#FFCD00", "Ipswich": "#0A4595",
-    "Burnley": "#6C1D45", "Sheffield United": "#EE2737", "Luton": "#F78F1E"
+# --- TEAM COLOR MAPPING ---
+team_colors = {
+    'Arsenal': '#EF0107', 'Aston Villa': '#95BFE5', 'AFC Bournemouth': '#DA291C',
+    'Brentford': '#E30613', 'Brighton & Hove Albion': '#0057B8', 'Burnley': '#6C1D45',
+    'Chelsea': '#034694', 'Crystal Palace': '#1B458F', 'Everton': '#003399',
+    'Fulham': '#FFFFFF', 'Ipswich Town': '#0033FF', 'Leeds United': '#FFCD00',
+    'Leicester City': '#003090', 'Liverpool': '#C8102E', 'Luton Town': '#F78F1E',
+    'Manchester City': '#6CABDD', 'Manchester United': '#DA291C', 'Newcastle United': '#241F20',
+    'Nottingham Forest': '#DD0000', 'Sheffield United': '#EE2737', 'Southampton': '#D71920',
+    'Sunderland': '#FF0000', 'Tottenham Hotspur': '#132257', 'Watford': '#FBEE23',
+    'West Ham United': '#7A263A', 'Wolverhampton Wanderers': '#FDB913', 'Norwich City': '#FFF200'
 }
 
-# 4. Dashboard UI
-col1, col2 = st.columns(2)
-with col1:
-    team_a = st.selectbox("Select Team 1", ALL_TEAMS, index=ALL_TEAMS.index("Arsenal"))
-with col2:
-    team_b = st.selectbox("Select Team 2", ALL_TEAMS, index=ALL_TEAMS.index("Manchester City"))
+# --- APP HEADER ---
+st.title("⚽ Premier League Market Analysis Engine")
+st.markdown("**Powered by XGBoost & Expected Goals (xG) Analytics**")
+st.markdown("---")
 
-venue = st.radio("Venue / Location", options=[f"{team_a} Home", f"{team_b} Home", "Neutral"], horizontal=True)
+tab1, tab2, tab3 = st.tabs(["Today's Edge (Live Matches)", "Historical Backtester", "Season Projections"])
 
-# --- VEGAS ODDS INPUT ---
-st.markdown("### 🏦 Enter Live Vegas Odds (American)")
-col_odds1, col_odds2, col_odds3 = st.columns(3)
-with col_odds1:
-    v_odds_home = st.number_input(f"{team_a} Odds", value=150)
-with col_odds2:
-    v_odds_draw = st.number_input("Draw Odds", value=250)
-with col_odds3:
-    v_odds_away = st.number_input(f"{team_b} Odds", value=180)
+# ==========================================
+# TAB 1: TODAY'S EDGE (Interactive Calendar)
+# ==========================================
+with tab1:
+    if 'view_date' not in st.session_state:
+        st.session_state.view_date = datetime.now().date()
 
-# Helper to convert American to Probability
-def american_to_prob(odds):
-    if odds > 0: return 100 / (odds + 100)
-    else: return abs(odds) / (abs(odds) + 100)
+    # --- CALENDAR CONTROLS ---
+    col_left, col_mid, col_right = st.columns([1, 3, 1])
 
-st.divider()
+    with col_left:
+        if st.button("⬅️ Previous Day"):
+            st.session_state.view_date -= timedelta(days=1)
+            st.rerun()
 
-# 5. Prediction Logic
-if st.button("Calculate Value & Predict", type="primary"):
-    if team_a == team_b:
-        st.error("Please select two different teams!")
+    with col_mid:
+        # FIX: Removed key='calendar_picker' so it doesn't fight the buttons
+        new_date = st.date_input("Select Date", value=st.session_state.view_date, label_visibility="collapsed")
+        if new_date != st.session_state.view_date:
+            st.session_state.view_date = new_date
+            st.rerun()
+        st.markdown(f"<h3 style='text-align: center;'>{st.session_state.view_date.strftime('%A, %b %d, %Y')}</h3>", unsafe_allow_html=True)
+
+    with col_right:
+        if st.button("Next Day ➡️"):
+            st.session_state.view_date += timedelta(days=1)
+            st.rerun()
+    st.divider()
+
+    # --- DATA NORMALIZATION ---
+    def standardize(name):
+        mapping = {
+            'Leeds United': 'Leeds',
+            'Brighton & Hove Albion': 'Brighton',
+            'Tottenham Hotspur': 'Tottenham',
+            'Wolverhampton Wanderers': 'Wolves', 
+            'West Ham United': 'West Ham',
+            'Newcastle United': 'Newcastle',
+            'AFC Bournemouth': 'Bournemouth',
+            'Sheffield United': 'Sheffield Utd',
+            'Nottingham Forest': "Nott'm Forest", 
+            'Luton Town': 'Luton',
+            'Ipswich Town': 'Ipswich',
+            'Leicester City': 'Leicester'
+        }
+        return mapping.get(name, name)
+
+    target_dt = pd.Timestamp(st.session_state.view_date).normalize()
+    now_dt = pd.Timestamp.now().normalize()
+    
+    sched_df['date_only'] = pd.to_datetime(sched_df['date']).dt.tz_localize(None).dt.normalize()
+    history_df['match_date_only'] = pd.to_datetime(history_df['match_date']).dt.tz_localize(None).dt.normalize()
+    
+    day_matches = sched_df[
+        (sched_df['league'] == 'ENG-Premier League') & 
+        (sched_df['date_only'] == target_dt)
+    ]
+
+    if day_matches.empty:
+        st.info(f"No Premier League matches scheduled for this date.")
     else:
-        try:
-            model = joblib.load('Data/xgboost_pl_model.pkl')
-            elo_dict = joblib.load('Data/elo_dict.pkl')
-        except FileNotFoundError:
-            st.error("Model files not found! Please run train_xgboost.py first.")
-            st.stop()
-        
-        a_att_raw, a_def_raw = get_rolling_stats(team_a, history)
-        b_att_raw, b_def_raw = get_rolling_stats(team_b, history)
-        a_elo = elo_dict.get(team_a, 1500)
-        b_elo = elo_dict.get(team_b, 1500)
-
-        def get_xgb_probs(h_att, h_def, h_elo, a_att, a_def, a_elo):
-            input_df = pd.DataFrame([{
-                'Home_Att_xG': h_att / LEAGUE_AVG_XG, 'Home_Def_xG': h_def / LEAGUE_AVG_XG,
-                'Home_Rest': 7, 'Home_Elo': h_elo,          
-                'Away_Att_xG': a_att / LEAGUE_AVG_XG, 'Away_Def_xG': a_def / LEAGUE_AVG_XG,
-                'Away_Rest': 7, 'Away_Elo': a_elo           
-            }])
-            p = model.predict_proba(input_df)[0]
-            return p[2]*100, p[1]*100, p[0]*100
-
-        if venue == f"{team_a} Home":
-            a_p, d_p, b_p = get_xgb_probs(a_att_raw, a_def_raw, a_elo, b_att_raw, b_def_raw, b_elo)
-        elif venue == f"{team_b} Home":
-            b_p, d_p, a_p = get_xgb_probs(b_att_raw, b_def_raw, b_elo, a_att_raw, a_def_raw, a_elo)
-        else:
-            a1, d1, b1 = get_xgb_probs(a_att_raw, a_def_raw, a_elo, b_att_raw, b_def_raw, b_elo)
-            b2, d2, a2 = get_xgb_probs(b_att_raw, b_def_raw, b_elo, a_att_raw, a_def_raw, a_elo)
-            a_p, b_p, d_p = (a1 + a2) / 2, (b1 + b2) / 2, (d1 + d2) / 2
-
-        # --- BETTING VALUE ANALYSIS ---
-        st.subheader("💰 Betting Value Analysis")
-        v_prob_h = american_to_prob(v_odds_home) * 100
-        v_prob_a = american_to_prob(v_odds_away) * 100
-        
-        # Hardcode the Sweet Spot found in backtesting
-        HISTORICAL_THRESHOLD = 4.6 
-        
-        val_col1, val_col2 = st.columns(2)
-        with val_col1:
-            edge_h = a_p - v_prob_h
-            if edge_h >= HISTORICAL_THRESHOLD: st.success(f"📊 Positive Edge: {team_a} (+{edge_h:.1f}%)")
-            elif edge_h <= -HISTORICAL_THRESHOLD: st.error(f"📉 Negative Edge: {team_a} ({edge_h:.1f}%)")
-            else: st.info(f"⚖️ Neutral Market: {team_a}")
+        for index, row in day_matches.iterrows():
+            home_raw, away_raw = row['home_team'], row['away_team']
+            home_std, away_std = standardize(home_raw), standardize(away_raw)
             
-        with val_col2:
-            edge_a = b_p - v_prob_a
-            if edge_a >= HISTORICAL_THRESHOLD: st.success(f"📊 Positive Edge: {team_b} (+{edge_a:.1f}%)")
-            elif edge_a <= -HISTORICAL_THRESHOLD: st.error(f"📉 Negative Edge: {team_b} ({edge_a:.1f}%)")
-            else: st.info(f"⚖️ Neutral Market: {team_b}")
+            match_check = history_df[
+                (history_df['match_date_only'] == target_dt) & 
+                (history_df['home_team'] == home_std)
+            ]
+            is_verified = not match_check.empty
+            
+            # --- ALWAYS CALCULATE AI PREDICTION ---
+            h_att, h_def = get_team_form(home_std)
+            a_att, a_def = get_team_form(away_std)
+            
+            X_live = pd.DataFrame([{
+                'Home_Att_xG': h_att, 'Home_Def_xG': h_def, 'Home_Rest': 7, 
+                'Home_Elo': current_elos.get(home_std, 1500),
+                'Away_Att_xG': a_att, 'Away_Def_xG': a_def, 'Away_Rest': 7, 
+                'Away_Elo': current_elos.get(away_std, 1500)
+            }])
+            
+            probs = model.predict_proba(X_live)[0] # [Away, Draw, Home]
+            
+            # Style Configurations
+            h_color = team_colors.get(home_raw, '#555555')
+            a_color = team_colors.get(away_raw, '#555555')
+            
+            dark_text_teams = ['Fulham', 'Wolverhampton Wanderers', 'Leeds United', 'Watford', 'Luton Town', 'Manchester City', 'Aston Villa', 'Norwich City']
+            h_text_color = '#000000' if home_raw in dark_text_teams else '#FFFFFF'
+            a_text_color = '#000000' if away_raw in dark_text_teams else '#FFFFFF'
 
-        # Projections Graph
-        prob_df = pd.DataFrame({"Outcome": [f"{team_a} Win", "Draw", f"{team_b} Win"], "Probability (%)": [a_p, d_p, b_p]})
-        color_map = {f"{team_a} Win": TEAM_COLORS.get(team_a, "#0984e3"), "Draw": "#b2bec3", f"{team_b} Win": TEAM_COLORS.get(team_b, "#d63031")}
-        fig = px.bar(prob_df, x="Probability (%)", y="Outcome", orientation='h', color="Outcome", text_auto='.1f', color_discrete_map=color_map)
-        fig.update_layout(showlegend=False, yaxis_title=None, height=300, xaxis=dict(range=[0, 100]))
+            # --- RENDER LOGIC (FLATTENED HTML FIX) ---
+            if target_dt < now_dt:
+                if is_verified:
+                    h_score = int(match_check.iloc[0]['home_goals'])
+                    a_score = int(match_check.iloc[0]['away_goals'])
+                else:
+                    h_score = int(row['home_score']) if pd.notna(row['home_score']) else 0
+                    a_score = int(row['away_score']) if pd.notna(row['away_score']) else 0
+                
+                h_border = "border: 4px solid #FFD700; box-shadow: 0px 0px 15px #FFD700;" if h_score > a_score else "border: 2px solid #333;"
+                a_border = "border: 4px solid #FFD700; box-shadow: 0px 0px 15px #FFD700;" if a_score > h_score else "border: 2px solid #333;"
+
+                # Flat string to avoid Streamlit Markdown parsing bugs
+                middle_section = (
+                    f"<div style='font-size: 28px; font-weight: 900; color: white;'>{h_score} - {a_score}</div>"
+                    f"<div style='font-size: 11px; color: #00ff87; margin-bottom: 8px; font-weight: bold;'>✅ FINAL</div>"
+                    f"<div style='font-size: 13px; color: #aaa; background: #222; padding: 4px 8px; border-radius: 5px; border: 1px solid #444; white-space: nowrap;'>AI Draw: {probs[1]*100:.1f}%</div>"
+                )
+            else:
+                highest_prob = np.max(probs)
+                h_border = "border: 4px solid #FFD700; box-shadow: 0px 0px 15px #FFD700;" if probs[2] == highest_prob else "border: 2px solid #333;"
+                a_border = "border: 4px solid #FFD700; box-shadow: 0px 0px 15px #FFD700;" if probs[0] == highest_prob else "border: 2px solid #333;"
+
+                # Flat string
+                middle_section = (
+                    f"<div style='font-weight: 900; font-size: 24px; color: white; margin-bottom: 15px;'>VS</div>"
+                    f"<div style='font-size: 13px; color: #aaa; background: #222; padding: 4px 8px; border-radius: 5px; border: 1px solid #444; white-space: nowrap;'>Draw: {probs[1]*100:.1f}%</div>"
+                )
+
+            # Flat master card
+            html_card = (
+                f"<div style='display: flex; flex-direction: row; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px;'>"
+                f"<div style='box-sizing: border-box; flex: 3; background-color: {h_color}; {h_border} padding: 15px; border-radius: 12px; text-align: center; color: {h_text_color}; font-weight: bold;'>"
+                f"<div style='font-size: 18px;'>{home_raw}</div>"
+                f"<div style='font-size: 24px; margin-top: 5px;'>{probs[2]*100:.1f}%</div>"
+                f"</div>"
+                f"<div style='box-sizing: border-box; flex: 2; text-align: center; display: flex; flex-direction: column; align-items: center;'>"
+                f"{middle_section}"
+                f"</div>"
+                f"<div style='box-sizing: border-box; flex: 3; background-color: {a_color}; {a_border} padding: 15px; border-radius: 12px; text-align: center; color: {a_text_color}; font-weight: bold;'>"
+                f"<div style='font-size: 18px;'>{away_raw}</div>"
+                f"<div style='font-size: 24px; margin-top: 5px;'>{probs[0]*100:.1f}%</div>"
+                f"</div>"
+                f"</div>"
+            )
+            
+            st.markdown(html_card, unsafe_allow_html=True)
+            st.divider()
+
+# ==========================================
+# TAB 2: HISTORICAL BACKTESTER
+# ==========================================
+with tab2:
+    st.header("Model Evaluation vs. Vegas")
+    try:
+        bankroll_df = pd.read_csv('Data/bankroll_history.csv')
+        bankroll_df['date'] = pd.to_datetime(bankroll_df['date'])
+        
+        st.write("Tracking a starting bankroll of $1,000 using the optimized mathematical edge threshold.")
+        
+        st.subheader("📈 AI Betting Bankroll Growth")
+        fig = px.line(bankroll_df, x='date', y='bankroll')
+        fig.add_hline(y=1000, line_dash="dash", line_color="red", annotation_text="Starting Bankroll")
+        fig.update_layout(xaxis_title="Timeline", yaxis_title="Bankroll ($)", showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
-
-        # --- STRATEGY TRANSPARENCY NOTE ---
+        
         st.markdown("---")
-        st.caption("🔍 Strategy Transparency & System Action")
+        st.subheader("💰 Backtesting Performance Metrics")
         
-        max_edge = max(edge_h, edge_a)
-        target_team = team_a if edge_h > edge_a else team_b
+        bankroll_changes = bankroll_df['bankroll'].diff().fillna(0)
+        bets_placed = (bankroll_changes.abs() > 0.01).sum()
+        winning_bets = (bankroll_changes > 0.01).sum()
+        total_profit = bankroll_df['bankroll'].iloc[-1] - 1000.0
         
-        st.write(f"The model calculates a maximum edge of **{max_edge:.1f}%** for **{target_team}** compared to the Vegas implied probabilities.")
+        strike_rate = (winning_bets / bets_placed) * 100 if bets_placed > 0 else 0
+        roi = (total_profit / (bets_placed * 100)) * 100 if bets_placed > 0 else 0
         
-        if max_edge >= HISTORICAL_THRESHOLD:
-            st.success(f"🤖 **System Action: SIMULATE WAGER**. The calculated edge exceeds the backtested optimization threshold of {HISTORICAL_THRESHOLD}%. In an automated environment, the algorithm would execute this trade.")
-        else:
-            st.warning(f"🛑 **System Action: PASS**. The calculated edge does not meet the backtested optimization threshold of {HISTORICAL_THRESHOLD}%. The algorithm requires a higher margin of safety to simulate a trade.")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Profit", f"${total_profit:,.2f}")
+        col2.metric("ROI", f"{roi:.1f}%")
+        col3.metric("Bets Placed", int(bets_placed))
+        col4.metric("Strike Rate", f"{strike_rate:.1f}%")
+        
+    except FileNotFoundError:
+        st.warning("⚠️ Warning: Run `python backtester.py` locally to generate the betting history data.")
 
-        st.caption("*Disclaimer: This dashboard is a mathematical simulation built for educational and portfolio demonstration purposes only. It does not constitute financial, trading, or sports betting advice. Predictions are based on historical data and do not guarantee future results.*")
+# ==========================================
+# TAB 3: SEASON PROJECTIONS (MONTE CARLO)
+# ==========================================
+with tab3:
+    st.header("🔮 End of Season Probability Matrix")
+    st.write("Simulating the remainder of the 2025/2026 season 10,000 times using live XGBoost probabilities.")
 
-# --- BANKROLL CHART SECTION ---
-# Unindented so it always displays upon app load
-st.divider()
-st.subheader("📈 Historical Performance Strategy")
+    @st.cache_data(ttl=86400) 
+    def get_cached_projections():
+        return generate_season_projections(n_sims=10000)
 
-try:
-    hist_df = pd.read_csv('Data/bankroll_history.csv')
-    hist_df['date'] = pd.to_datetime(hist_df['date'])
-    
-    fig_hist = px.line(hist_df, x='date', y='bankroll', 
-                       title="Backtested Bankroll Growth (Best Edge Threshold)",
-                       labels={'bankroll': 'Bankroll ($)', 'date': 'Match Date'})
-    
-    fig_hist.add_hline(y=1000, line_dash="dash", line_color="red", annotation_text="Initial Capital")
-    st.plotly_chart(fig_hist, use_container_width=True)
-    
-    final_cash = hist_df['bankroll'].iloc[-1]
-    st.metric("Strategy Net Profit", f"${final_cash - 1000:,.2f}", 
-              delta=f"{((final_cash - 1000) / 1000) * 100:.1f}% ROI")
+    with st.spinner("Calculating 10,000 Vectorized Universes..."):
+        rank_df = get_cached_projections()
 
-except FileNotFoundError:
-    st.info("Run backtester.py to generate your strategy's performance chart!")
+    def format_prob(val):
+        if val == 0: return ""
+        elif val < 0.1: return "<0.1"
+        else: return f"{val:.1f}"
 
-# --- RESEARCH & ROADMAP SECTION ---
-st.divider()
-st.markdown("""
-### 🔬 Model Roadmap: The Path to Positive ROI
-Current backtesting shows an **8.9% ROI** on high-confidence bets, but low volume. To scale this into a professional-grade trading engine, the following features are in development:
+    st.markdown("<h3 style='text-align: center; margin-bottom: -20px;'>Table Position</h3>", unsafe_allow_html=True)
+    rank_df.index.name = "Team"
+    styled_df = rank_df.style.format(format_prob)\
+                     .background_gradient(cmap='Greens', axis=None, vmin=0, vmax=100)
 
-1. **🏥 Squad Rotation & Injury Weights**: 
-   - *Current State*: Uses team-level rolling xG.
-   - *Next Step*: Integrate player-specific xG contributions. If a striker responsible for 40% of a team's xG (e.g., Haaland) is out, the 'Attack xG' parameter will automatically scale down by that percentage.
-
-2. **✈️ Travel & Fatigue Decay**: 
-   - *Current State*: Simple days-of-rest counter.
-   - *Next Step*: Calculate 'Travel Fatigue' based on mid-week European competitions (Champions League/Europa). Teams returning from away games in Eastern Europe show a statistically significant dip in defensive intensity.
-
-3. **📊 Market Sentiment Analysis**: 
-   - *Goal*: Compare 'Model Odds' vs 'Closing Line Value' (CLV). Tracking the movement of Vegas odds in the 2 hours before kickoff to identify 'Sharp Money' vs 'Public Money' traps.
-
-4. **📉 Bayesian Updating**: 
-   - *Goal*: Transition from a static XGBoost model to a Bayesian framework that learns faster from mid-season managerial changes (the 'New Manager Bounce' effect).
-""")
-
-st.caption("Developed by Liam Thomas Condon | Computational Modeling & Data Analytics @ Virginia Tech")
+    st.dataframe(styled_df, use_container_width=True, height=750)
